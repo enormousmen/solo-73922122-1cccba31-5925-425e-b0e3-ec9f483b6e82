@@ -11,79 +11,108 @@ from typing import Any
 from fastapi import Body, FastAPI
 from fastapi.responses import JSONResponse
 
-from .matching import NoPathError, match_trip
 from .schemas import (
-    CandidateInfo,
-    MatchFailure,
-    MatchRequest,
-    MatchResponse,
-    MatchedPoint,
-    MatchSuccess,
+    BlockingTripOut,
+    MileageBreakdown,
+    PlanInfeasible,
+    PlanSuccess,
+    ScheduleRequest,
+    ScheduleResponse,
+    VehiclePlanOut,
 )
+from .solver import InfeasibleError, compute_plan
 
 app = FastAPI(
-    title="公交行程里程匹配 API",
+    title="公交电动车配车测算 API",
     version="1.0.0",
     description=(
-        "对单次行程的车载定位点沿有序线路折线做投影匹配，在「里程不倒退、"
-        "相邻里程差不超过速度上限 × 时间差」的约束下，返回总平方偏离最小的"
-        "完整路径；无完整路径时返回首个无法延续的位置及原因。坐标均为米制平面坐标。"
+        "核算一批固定班次（1～12 个）最少需要几辆电动车。车辆 0 秒起自同一车场"
+        "满电出车，允许等待、不补能，末班后必须回场；班次衔接不得迟到（等号可接上），"
+        "空驶时间与里程直接采用输入矩阵；每车含出场、转场、回场的总里程不得超过统一续航。"
+        "精确求最少车辆数并给出任一最优方案（逐车班次顺序与总里程）；无解时说明原因，"
+        "不返回部分安排；输入非法时返回 422 并定位出错字段。"
     ),
 )
 
 # ---------------------------------------------------------------------------
-# OpenAPI 示例：包含环线重叠（共线）路段
-# 折线几何（单位米）：
-#   (0,0)->(100,0)->(100,100)->(0,100)->(0,0)->(0,-50)
-# 其中 0->1 段（(0,0)->(100,0)）与 4->3 段（(0,0)->(0,100) 反向即
-# (0,100)->(0,0)）在 (0,0) 周边形成环线重叠；闭合后第 4 段再次经过起点。
-# 定位点 (50, 2) 同时落在线段 0（里程 50）和闭合环线回来的共线位置上，
-# 由 DP 的里程单调性 + 速度约束完成消歧。
+# OpenAPI 示例
 # ---------------------------------------------------------------------------
-_OVERLAP_EXAMPLE: dict[str, Any] = {
-    "summary": "含共线重叠段的环线行程，DP 全局消歧",
+# 累计里程受限：三个班次时间上完全可由一辆车衔接，但一车跑完全程需
+# 8000+20000*3+11000=79000 米，超过续航 60000 米，只能拆成 2 车。
+_MILEAGE_LIMITED_EXAMPLE: dict[str, Any] = {
+    "summary": "累计里程受限：时间可衔接，但续航迫使 1 车变 2 车",
     "value": {
-        "polyline": [
-            {"x": 0, "y": 0},
-            {"x": 100, "y": 0},
-            {"x": 100, "y": 100},
-            {"x": 0, "y": 100},
-            {"x": 0, "y": 0},
-            {"x": 0, "y": -50},
+        "depot": "车场",
+        "locations": ["车场", "甲站", "乙站"],
+        "deadhead_seconds": [
+            [0, 600, 900],
+            [600, 0, 240],
+            [900, 240, 0],
         ],
-        "points": [
-            {"x": 2, "y": 1, "timestamp": "2026-11-11T08:00:00"},
-            {"x": 50, "y": 2, "timestamp": "2026-11-11T08:00:50"},
-            {"x": 98, "y": 3, "timestamp": "2026-11-11T08:01:40"},
-            {"x": 102, "y": 50, "timestamp": "2026-11-11T08:02:40"},
-            {"x": 101, "y": 99, "timestamp": "2026-11-11T08:03:30"},
-            {"x": 50, "y": 102, "timestamp": "2026-11-11T08:04:30"},
-            {"x": 1, "y": 101, "timestamp": "2026-11-11T08:05:20"},
-            {"x": -2, "y": 50, "timestamp": "2026-11-11T08:06:20"},
-            {"x": -1, "y": 1, "timestamp": "2026-11-11T08:07:10"},
-            {"x": 0, "y": -30, "timestamp": "2026-11-11T08:08:00"},
+        "deadhead_meters": [
+            [0, 8000, 11000],
+            [8000, 0, 4000],
+            [11000, 4000, 0],
         ],
-        "max_deviation": 5.0,
-        "max_speed": 15.0,
+        "range_meters": 60000,
+        "trips": [
+            {"id": "T1", "origin": "甲站", "destination": "乙站",
+             "start": 25200, "end": 27000, "distance": 20000},
+            {"id": "T2", "origin": "乙站", "destination": "甲站",
+             "start": 27600, "end": 29400, "distance": 20000},
+            {"id": "T3", "origin": "甲站", "destination": "乙站",
+             "start": 30000, "end": 31800, "distance": 20000},
+        ],
     },
 }
 
-_NO_PATH_EXAMPLE: dict[str, Any] = {
-    "summary": "相邻定位点里程增量超过速度上限 × 时间差",
+# 时间冲突：两个班次时段重叠，必须 2 车。
+_TIME_OVERLAP_EXAMPLE: dict[str, Any] = {
+    "summary": "时段重叠：两个班次时间冲突，需 2 车",
     "value": {
-        "polyline": [
-            {"x": 0, "y": 0},
-            {"x": 100, "y": 0},
-            {"x": 200, "y": 0},
+        "depot": "车场",
+        "locations": ["车场", "甲站", "乙站"],
+        "deadhead_seconds": [
+            [0, 600, 900],
+            [600, 0, 240],
+            [900, 240, 0],
         ],
-        "points": [
-            {"x": 0, "y": 0, "timestamp": 0},
-            # 10 秒内沿线路前进 150 米，需要 15 m/s，超过上限 5 m/s（允许 50 米）
-            {"x": 150, "y": 0, "timestamp": 10},
-            {"x": 200, "y": 0, "timestamp": 20},
+        "deadhead_meters": [
+            [0, 8000, 11000],
+            [8000, 0, 4000],
+            [11000, 4000, 0],
         ],
-        "max_deviation": 5.0,
-        "max_speed": 5.0,
+        "range_meters": 60000,
+        "trips": [
+            {"id": "A1", "origin": "甲站", "destination": "乙站",
+             "start": 25200, "end": 27000, "distance": 15000},
+            {"id": "A2", "origin": "乙站", "destination": "甲站",
+             "start": 25800, "end": 27600, "distance": 15000},
+        ],
+    },
+}
+
+# 无解：单班次最小总里程 8000+45000+11000=64000 米 > 续航 60000 米。
+_INFEASIBLE_EXAMPLE: dict[str, Any] = {
+    "summary": "无解：单班次里程已超续航，整体无解且不返回部分安排",
+    "value": {
+        "depot": "车场",
+        "locations": ["车场", "甲站", "乙站"],
+        "deadhead_seconds": [
+            [0, 600, 900],
+            [600, 0, 240],
+            [900, 240, 0],
+        ],
+        "deadhead_meters": [
+            [0, 8000, 11000],
+            [8000, 0, 4000],
+            [11000, 4000, 0],
+        ],
+        "range_meters": 60000,
+        "trips": [
+            {"id": "B1", "origin": "甲站", "destination": "乙站",
+             "start": 25200, "end": 28800, "distance": 45000},
+        ],
     },
 }
 
@@ -96,7 +125,7 @@ def health() -> dict[str, str]:
 @app.get("/", tags=["运维"])
 def root() -> dict[str, Any]:
     return {
-        "service": "bus-trip-mileage-matching",
+        "service": "bus-ev-vehicle-scheduling",
         "docs": "/docs",
         "redoc": "/redoc",
         "openapi": "/openapi.json",
@@ -104,53 +133,57 @@ def root() -> dict[str, Any]:
 
 
 @app.post(
-    "/api/v1/trips/match",
-    response_model=MatchResponse,
-    tags=["里程匹配"],
-    summary="单次行程里程匹配",
+    "/api/v1/vehicle-schedules/compute",
+    response_model=ScheduleResponse,
+    tags=["配车测算"],
+    summary="固定班次最少配车数测算",
     responses={
         200: {
-            "description": "匹配成功返回 matched；无完整路径返回 no_path（均为 HTTP 200，"
-            "用 status 字段区分；请求参数本身非法时返回 422）。",
+            "description": "有解返回 ok（最少车辆数与任一最优方案）；无解返回 "
+            "infeasible（原因说明，不含部分安排）。均为 HTTP 200，用 status "
+            "字段区分；请求参数本身非法时返回 422 并定位出错字段。",
         }
     },
 )
-def match(
-    request: MatchRequest = Body(
+def compute(
+    request: ScheduleRequest = Body(
         ...,
         openapi_examples={
-            "overlap": _OVERLAP_EXAMPLE,
-            "no_path": _NO_PATH_EXAMPLE,
+            "mileage_limited": _MILEAGE_LIMITED_EXAMPLE,
+            "time_overlap": _TIME_OVERLAP_EXAMPLE,
+            "infeasible": _INFEASIBLE_EXAMPLE,
         },
     )
 ) -> JSONResponse:
     try:
-        matched = match_trip(request)
-    except NoPathError as exc:
-        payload = MatchFailure(
-            failed_index=exc.failed_index,
-            reason_code=exc.reason_code,  # type: ignore[arg-type]
-            reason=exc.reason,
-            candidates=[
-                CandidateInfo(
-                    segment_index=c.segment_index,
-                    mileage=round(c.mileage, 6),
-                    deviation=round(c.deviation, 6),
-                )
-                for c in exc.candidates[:50]
+        plan = compute_plan(request)
+    except InfeasibleError as exc:
+        payload = PlanInfeasible(
+            reason=str(exc),
+            blocking_trips=[
+                BlockingTripOut(trip_id=b.trip_id, reasons=b.reasons)
+                for b in exc.blocking
             ],
         )
         return JSONResponse(content=payload.model_dump())
 
-    payload = MatchSuccess(
-        points=[
-            MatchedPoint(
-                index=i,
-                segment_index=c.segment_index,
-                mileage=round(c.mileage, 6),
-                deviation=round(c.deviation, 6),
+    payload = PlanSuccess(
+        vehicle_count=plan.vehicle_count,
+        vehicles=[
+            VehiclePlanOut(
+                vehicle=k,
+                trips=v.trips,
+                depot_departure_second=v.depot_departure_second,
+                depot_return_second=v.depot_return_second,
+                mileage=MileageBreakdown(
+                    pull_out=v.pull_out_meters,
+                    between_trips=v.between_trips_meters,
+                    trips=v.trips_meters,
+                    pull_in=v.pull_in_meters,
+                    total=v.total_meters,
+                ),
             )
-            for i, c in enumerate(matched)
-        ]
+            for k, v in enumerate(plan.vehicles, start=1)
+        ],
     )
     return JSONResponse(content=payload.model_dump())

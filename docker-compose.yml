@@ -1,8 +1,8 @@
 services:
-  mileage-matching-api:
+  vehicle-scheduling-api:
     build: .
-    image: bus-mileage-matching:1.0.0
-    container_name: bus-mileage-matching
+    image: bus-ev-vehicle-scheduling:1.0.0
+    container_name: bus-ev-vehicle-scheduling
     ports:
       - "8000:8000"
     restart: unless-stopped
